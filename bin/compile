@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# bin/compile <build-dir> <cache-dir>
+
+# fail fast
+set -e
+
+DEPENDENCY_S3_BUCKET_PATH="https://stefan-mono.s3-eu-west-1.amazonaws.com"
+XSP_VERSION="8a31bc625727594d42f94173768bee5cf8afd0a4"
+HYPERFASTCGI_PATH="https://stefan-mono.s3-eu-west-1.amazonaws.com/hyperfastcgi-0.4.4.0.cedar-14.tar.gz"
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+
+function conditional_download() {
+  DOWNLOAD_URL="$1"
+  DESTINATION="$2"
+
+  if [ ! -d ${DESTINATION} ]; then
+    rm -rf ${DESTINATION}
+    mkdir -p ${DESTINATION}
+    echo "-----> Downloading ${DOWNLOAD_URL}"
+    curl ${DOWNLOAD_URL} -s | tar xz -C ${DESTINATION}
+  fi
+}
+
+export_env_dir() {
+  env_dir=$1
+  whitelist_regex=${2:-''}
+  blacklist_regex=${3:-'^(PATH|GIT_DIR|CPATH|CPPATH|LD_PRELOAD|LIBRARY_PATH|STACK)$'}
+  if [ -d "$env_dir" ]; then
+    for e in $(ls $env_dir); do
+      echo "$e" | grep -E "$whitelist_regex" | grep -qvE "$blacklist_regex" &&
+      export "$e=$(cat $env_dir/$e)"
+      :
+    done
+  fi
+}
+
+export_env_dir $ENV_DIR
+
+
+MONO_VERSION=${MONO_VERSION:-3.10.0}
+echo "-----> Using mono $MONO_VERSION"
+
+export ENVIRONMENT_TYPE=${ENVIRONMENT_TYPE:-prod}
+
+LP_DIR=`cd $(dirname $0); cd ..; pwd`
+cd ${BUILD_DIR}
+mkdir -p ${CACHE_DIR}
+
+MONO_CACHE_LOCATION=${CACHE_DIR}/$STACK/mono-${MONO_VERSION}
+conditional_download ${DEPENDENCY_S3_BUCKET_PATH}/${STACK}/mono-${MONO_VERSION}-full.tar.gz ${MONO_CACHE_LOCATION}
+
+# Copy mono from cache to where we're building the slug
+cp -r "${MONO_CACHE_LOCATION}/mono" .
+# Mono expects to be running out of /app
+ln -s "$BUILD_DIR/mono" /app
+
+# find a solution file
+SLN=$(find . -maxdepth 1 -iname "*.sln")
+if [ $( echo "${SLN}" | wc -l ) -gt 1 ]; then
+  echo "-----> Too many *.sln files"
+  exit 1
+fi
+
+if [ "${SLN}" == "" ]; then
+  echo "-----> No *.sln file found"
+  exit 1
+fi
+
+echo "-----> Compiling Mono application"
+
+if [ -z "${MONO_INSTALLED}" ]; then
+	export PATH="/app/mono/bin:${PATH}"
+	export LD_LIBRARY_PATH="/app/mono/lib:${LD_LIBRARY_PATH}"
+fi
+
+# Add certs to trust store
+cp -r ${LP_DIR}/.config ~/.
+cp -r ${LP_DIR}/.config ${BUILD_DIR}/.
+
+NUGET_EXECUTABLE_PATH=${CACHE_DIR}/nuget.exe
+if [ ! -f ${NUGET_EXECUTABLE_PATH} ]; then
+  curl -LSso ${NUGET_EXECUTABLE_PATH} http://nuget.org/nuget.exe
+fi
+
+BUILD_CACHE_LOCATION=${CACHE_DIR}/build/
+mkdir -p ${BUILD_CACHE_LOCATION}
+
+if [[ $MONO_VERSION == 5* ]] || [[ $MONO_VERSION == 6* ]] ;
+then
+    cert-sync --user /etc/ssl/certs/ca-certificates.crt
+fi
+
+mono ${NUGET_EXECUTABLE_PATH} restore -NonInteractive
+xbuild /property:Configuration=Release /property:OutDir=${BUILD_CACHE_LOCATION} ${SLN}
+
+cp -r ${BUILD_CACHE_LOCATION}* ${BUILD_DIR}
+
+mkdir -p ${BUILD_DIR}/.profile.d
+cp -n ${LP_DIR}/.profile.d/* ${BUILD_DIR}/.profile.d/
+
+if [ -d "$BUILD_DIR/_PublishedWebsites/" ]; then
+  XSP_CACHE_LOCATION=${CACHE_DIR}/${STACK}/xsp-${XSP_VERSION}
+  conditional_download ${DEPENDENCY_S3_BUCKET_PATH}/${STACK}/xsp-${XSP_VERSION}.tar.gz ${XSP_CACHE_LOCATION}
+  cp -r ${XSP_CACHE_LOCATION}/xsp .
+  cp -r ${XSP_CACHE_LOCATION}/xsp/lib/mono/gac/* ./mono/lib/mono/gac/
+
+  #donwloading HyperFastCgi
+  HYPERFASTCGI_CACHE_LOCATION=${CACHE_DIR}/${STACK}/hyperfastcgi-0.4.4.0
+  conditional_download $HYPERFASTCGI_PATH $HYPERFASTCGI_CACHE_LOCATION
+  cp -r ${HYPERFASTCGI_CACHE_LOCATION}/hyperfastcgi .
+  cp -r ${HYPERFASTCGI_CACHE_LOCATION}/hyperfastcgi/lib/mono/gac/* ./mono/lib/mono/gac/
+
+  NGINX_CACHE_PATH=${CACHE_DIR}/${STACK}/nginx
+  conditional_download ${DEPENDENCY_S3_BUCKET_PATH}/${STACK}/nginx.tar.gz ${NGINX_CACHE_PATH}
+
+  mkdir -p ${BUILD_DIR}/nginx
+  cp ${NGINX_CACHE_PATH}/nginx ${BUILD_DIR}/nginx/.
+  # Copy nginx configuration from buildpack dir
+  cp ${LP_DIR}/nginx/* ${BUILD_DIR}/nginx/.
+  
+  NGINX_CONFIGS=$(find "$BUILD_DIR/_PublishedWebsites/" -maxdepth 2 -iname "nginxserver.${ENVIRONMENT_TYPE}.config")
+
+  if [ "$NGINX_CONFIGS" != "" ]; then
+    # sed -e '1s/^\xef\xbb\xbf//' -> against BOM-s
+	 for file in $NGINX_CONFIGS; do cat $file | sed -e '1s/^\xef\xbb\xbf//'; echo ""; done >> ${BUILD_DIR}/nginx/server_config
+  fi
+fi
+
+echo "-----> Build SUCCESS"

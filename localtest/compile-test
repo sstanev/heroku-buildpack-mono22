@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+
+export STACK=cedar-14
+export MONO_INSTALLED=yes
+export MONO_VERSION=4.0.5.1
+PROJECT_ROOT=/home/stefanstanev/Documents/projects/heroku-buildpack-test
+
+mkdir -p /app
+
+rm -rf /app/*
+rm -rf $PROJECT_ROOT/builddir/nginx
+rm -rf $PROJECT_ROOT/builddir/_PublishedWebsites
+
+../bin/compile $PROJECT_ROOT/builddir $PROJECT_ROOT/cachedir $PROJECT_ROOT/envdir

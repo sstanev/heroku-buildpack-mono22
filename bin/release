@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# bin/release <build-dir>
+
+# important directories: https://gist.github.com/fe7f04abbd9538b656c5
+BUILD_DIR=$1
+
+cat <<EOF
+---
+EOF
+
+if [ -d "$BUILD_DIR/_PublishedWebsites/" ]; then
+    cat <<EOF
+default_process_types:
+  web: /app/nginx/start
+EOF
+fi

@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Mostly taken from nginx-buildpack: https://github.com/ryandotsmith/nginx-buildpack
+
+psmgr=/tmp/process-wait
+rm -f $psmgr
+mkfifo $psmgr
+
+erb /app/nginx/nginx.conf.erb > /app/nginx/nginx.conf
+
+if [ "${USE_HYPERFASTCGI}" != "" ]; then
+	erb /app/nginx/nginx.conf.hfc.erb > /app/nginx/nginx.conf
+fi
+
+#Initialize log directory
+mkdir -p /app/nginx/logs
+touch /app/nginx/logs/access.log /app/nginx/logs/error.log
+
+FASTCGI_ROOT=/app/xsp/bin/
+if [ -n "${MONO_INSTALLED}" ]; then
+	FASTCGI_ROOT=""
+fi
+
+# try to get the ENVIRONMENT_TYPE environment variable, if missing, use the default value 'prod' 
+ENVIRONMENT_TYPE=${ENVIRONMENT_TYPE:-prod}
+
+# init the APPLICATIONS_PARAM with the default value, the first website in /app/_PublishedWebsites/
+APPLICATIONS_PARAM=/:/app/_PublishedWebsites/`ls /app/_PublishedWebsites/ | head -1`
+
+# get the webapplications.xxxx.config files if present
+APPCONFIG=$(find /app/_PublishedWebsites/ -maxdepth 2 -iname "webapplications.${ENVIRONMENT_TYPE}.config")
+
+if [ "${APPCONFIG}" != "" ]; then
+	# this iterates the webapplications.xxxx.config files and concatenates the contents using ',' as separator
+	# IFS='/' read -a array <<< "$file" -> splits the file path by '/', the third element is the containing folder of the website
+	# cat $file | sed -e "s/\:\./\:\/app\/_PublishedWebsites\/${array[3]}/g" -> this reads the file and replaces ':.' with the absolute path to the deployed site
+	# sed -e 's/,$//g' -> this removes the trailing comma
+	# sed -e '1s/^\xef\xbb\xbf//' -> this remove the BOM headers
+
+	APPLICATIONS_PARAM=$(for file in $APPCONFIG; do IFS='/' read -a array <<< "$file"; cat $file | sed -e "s/\:\./\:\/app\/_PublishedWebsites\/${array[3]}/g" -e 's/,$//g' -e '1s/^\xef\xbb\xbf//'; echo -n ','; done | sed -e 's/,$//g')
+fi
+
+APP_CMD="${FASTCGI_ROOT}fastcgi-mono-server4 /applications=${APPLICATIONS_PARAM} /socket=unix:/tmp/nginx.socket"
+if [ "${USE_HYPERFASTCGI}" != "" ]; then
+	APP_CMD="/app/hyperfastcgi/HyperFastCgi-start /config=/app/nginx/hfc-tcp.config /applications=${APPLICATIONS_PARAM} /loglevels=Error /printlog /addtrailingslash=false"
+fi
+
+#Start log redirection.
+(
+    #Redirect NGINX logs to stdout
+    tail -qF -n 0 /app/nginx/logs/*.log
+    echo 'logs' >$psmgr
+) &
+
+#Start app server
+(
+    MONO_OPTIONS=--server $APP_CMD
+    echo 'app' >$psmgr
+) &
+
+#Start nginx
+(
+    #We expect nginx to run in foreground
+    #We also expect a socket to be at /tmp/nginx.socket
+    /app/nginx/nginx -p /app/nginx -c /app/nginx/nginx.conf
+    echo 'nginx' >$psmgr
+) &
+
+#This read will block the process waiting on a msg to be put into the fifo.
+#If any of the processes defined above should exit,
+#a msg will be put into the fifo causing the read operation
+#to un-block. The process putting the msg into the fifo
+#will use it's process name as a msg so that we can print the offending
+#process to stdout.
+read exit_process <$psmgr
+echo "buildpack=nginx at=exit process=$exit_process"
+exit 1

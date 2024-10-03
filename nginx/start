@@ -5,11 +5,8 @@ psmgr=/tmp/process-wait
 rm -f $psmgr
 mkfifo $psmgr
 
-erb /app/nginx/nginx.conf.erb > /app/nginx/nginx.conf
-
-if [ "${USE_HYPERFASTCGI}" != "" ]; then
-	erb /app/nginx/nginx.conf.hfc.erb > /app/nginx/nginx.conf
-fi
+#erb /app/nginx/nginx.conf.erb > /app/nginx/nginx.conf
+sed  "s/<%= ENV\['PORT'\] %>/${PORT}/g" /app/nginx/nginx.conf.erb > /app/nginx/nginx.conf
 
 #Initialize log directory
 mkdir -p /app/nginx/logs
